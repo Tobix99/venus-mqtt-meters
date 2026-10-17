@@ -199,3 +199,7 @@ setup.sh               install / restart / uninstall on Venus OS
 service/run            daemontools run script
 service/log/run        daemontools log script (multilog → /var/log/venus-mqtt-meters)
 ```
+
+## License
+
+[MIT](LICENSE)
