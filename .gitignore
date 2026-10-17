@@ -1,0 +1,4 @@
+config.ini
+__pycache__/
+service/supervise/
+service/log/supervise/
