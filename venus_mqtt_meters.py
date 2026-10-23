@@ -25,7 +25,7 @@ for p in VELIB_PATHS:
 from settingsdevice import SettingsDevice  # noqa: E402
 from vedbus import VeDbusService  # noqa: E402
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 PRODUCT_ID_GENERIC = 0xFFFF
 PHASES = ("L1", "L2", "L3")
 STATUS_RUNNING, STATUS_STANDBY = 7, 8
@@ -42,6 +42,7 @@ class Device:
 
     role = None
     default_instance = None
+    ignore_retained = False
 
     def __init__(self, settings_bus, ident, name, timeout, connection):
         self.ident = ident
@@ -74,7 +75,8 @@ class Device:
         raise NotImplementedError
 
     def value_paths(self):
-        return [p for p in self.service._dbusobjects if p.startswith("/Ac/") or p in ("/StatusCode",)]
+        return [p for p in self.service._dbusobjects
+                if p.startswith(("/Ac/", "/Dc/")) or p in ("/StatusCode",)]
 
     def stage(self, values):
         with self._lock:
@@ -188,6 +190,56 @@ class OpenDtuInverter(Device):
             self.stage({"/StatusCode": status})
 
 
+class OpenDtuDcLoad(Device):
+    """DC input of a battery-fed inverter as dcsystem, so DVCC adds it to the MPPT charge limit.
+
+    Fail-safe: retained, stale or implausible readings clear the values, which DVCC treats as 0 A.
+    """
+    role = "dcsystem"
+    default_instance = 30
+    ignore_retained = True  # a retained value may be hours old
+
+    def __init__(self, settings_bus, prefix, serial, name, max_power, factor, timeout):
+        self.base = f"{prefix.rstrip('/')}/{serial}"
+        self.factor = factor
+        self.max_dc_power = max_power * 1.15  # DC input incl. conversion losses
+        self._voltage = None
+        super().__init__(settings_bus, f"opendtu_{serial}_dc", f"{name} DC input", timeout,
+                         f"MQTT {self.base}")
+
+    def add_paths(self):
+        for p in ("/Dc/0/Voltage", "/Dc/0/Current", "/Dc/0/Power"):
+            self.service.add_path(p, None)
+
+    def topics(self):
+        return [f"{self.base}/0/powerdc", f"{self.base}/1/voltage", f"{self.base}/status/reachable"]
+
+    def on_message(self, topic, payload):
+        key = topic.rsplit("/", 1)[-1]
+        value = float(payload)
+        if key == "voltage":
+            self._voltage = value if value > 0 else None
+            return
+        if key == "reachable":
+            if not int(value):
+                self.expire()
+            return
+        # powerdc: positive = consumed from the DC bus
+        if not 0 <= value <= self.max_dc_power:
+            log.warning("%s: implausible DC power %.1f W, ignored", self.ident, value)
+            return
+        power = round(value * self.factor, 1)
+        v = self._voltage
+        self.stage({"/Dc/0/Power": power, "/Dc/0/Voltage": v,
+                    "/Dc/0/Current": round(power / v, 2) if v else None})
+
+    def expire(self):
+        """Mark stale now instead of waiting for the timeout."""
+        with self._lock:
+            self._staged = {}
+            self.last_seen = 0.0
+
+
 def load_config(path):
     cfg = configparser.ConfigParser()
     if not cfg.read(path):
@@ -208,19 +260,31 @@ def main():
     if cfg.has_section("shelly"):
         devices.append(ShellyGrid(settings_bus, cfg["shelly"]["topic_prefix"], timeout))
     dtu_prefix = cfg.get("opendtu", "topic_prefix", fallback="solar")
+    dc_load = cfg.getboolean("opendtu", "dc_load", fallback=False)
+    dc_factor = cfg.getfloat("opendtu", "dc_load_factor", fallback=1.0)
+    dc_timeout = cfg.getint("opendtu", "dc_load_timeout", fallback=15)
+    if not 0 < dc_factor <= 1:
+        sys.exit("[opendtu] dc_load_factor must be in (0, 1]")
     for section in cfg.sections():
         if section.startswith("inverter:"):
             s = cfg[section]
             phase = s.get("phase", "L1").upper()
             if phase not in PHASES:
                 sys.exit(f"[{section}] phase must be one of {PHASES}")
+            serial, name = section.split(":", 1)[1], s.get("name", "Hoymiles")
+            max_power = s.getint("max_power", fallback=800)
             devices.append(OpenDtuInverter(
-                settings_bus, dtu_prefix, section.split(":", 1)[1], s.get("name", "Hoymiles"),
-                phase, s.getint("max_power", fallback=800), timeout))
+                settings_bus, dtu_prefix, serial, name, phase, max_power, timeout))
+            if s.getboolean("dc_load", fallback=dc_load):
+                devices.append(OpenDtuDcLoad(
+                    settings_bus, dtu_prefix, serial, name, max_power, dc_factor, dc_timeout))
     if not devices:
         sys.exit("No devices configured")
 
-    routes = {t: d for d in devices for t in d.topics()}
+    routes = {}
+    for d in devices:
+        for t in d.topics():
+            routes.setdefault(t, []).append(d)
 
     def on_connect(client, _userdata, _flags, reason, _props):
         if reason.is_failure:
@@ -230,13 +294,19 @@ def main():
         client.subscribe([(t, 0) for t in routes])
 
     def on_message(_client, _userdata, msg):
-        device = routes.get(msg.topic)
-        if device is None:
-            return
-        try:
-            device.on_message(msg.topic, msg.payload)
-        except (ValueError, TypeError) as e:
-            log.warning("Bad payload on %s: %s", msg.topic, e)
+        for device in routes.get(msg.topic, ()):
+            if msg.retain and device.ignore_retained:
+                continue
+            try:
+                device.on_message(msg.topic, msg.payload)
+            except (ValueError, TypeError) as e:
+                log.warning("Bad payload on %s: %s", msg.topic, e)
+
+    def on_disconnect(_client, _userdata, _flags, reason, _props):
+        log.warning("MQTT disconnected: %s", reason)
+        for d in devices:
+            if isinstance(d, OpenDtuDcLoad):
+                d.expire()
 
     m = cfg["mqtt"]
     client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2,
@@ -245,6 +315,7 @@ def main():
         client.username_pw_set(m["username"], m.get("password"))
     client.on_connect = on_connect
     client.on_message = on_message
+    client.on_disconnect = on_disconnect
     client.reconnect_delay_set(1, 30)
     client.connect_async(m["host"], m.getint("port", fallback=1883), keepalive=30)
     client.loop_start()

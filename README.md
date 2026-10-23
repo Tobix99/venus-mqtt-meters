@@ -30,6 +30,7 @@ already there, so:
 
 - Shelly Pro 3EM as `grid` meter: total and per-phase power, voltage, current, import/export energy.
 - Any number of OpenDTU inverters as `pvinverter`: power, voltage, current, total yield, running/standby status.
+- Optional: the inverters' DC input as `dcsystem`, so DVCC lets the MPPTs cover battery-fed inverters.
 - Pushes values to D-Bus once per second.
 - Watchdog: a device that sends no data for `timeout` seconds is marked disconnected and its
   values are cleared, instead of silently freezing on the last value.
@@ -55,6 +56,7 @@ already there, so:
 | OpenDTU | `<dtu-prefix>/<serial>/0/voltage`, `.../0/current`     | AC voltage and current                        |
 | OpenDTU | `<dtu-prefix>/<serial>/0/yieldtotal`                   | total energy (kWh)                            |
 | OpenDTU | `<dtu-prefix>/<serial>/status/reachable`, `.../producing` | running / standby status                   |
+| OpenDTU | `<dtu-prefix>/<serial>/0/powerdc`, `.../1/voltage`     | DC input power and voltage (only with `dc_load`) |
 
 ### Steady Shelly updates
 
@@ -82,6 +84,7 @@ OpenDTU-OnBattery's dynamic power limiter).
 |------------------------------------------------------|--------------|------------------|
 | `com.victronenergy.grid.mqtt_shelly_<mac>`           | grid meter   | 40               |
 | `com.victronenergy.pvinverter.mqtt_opendtu_<serial>` | PV inverter  | 20, 21, ...      |
+| `com.victronenergy.dcsystem.mqtt_opendtu_<serial>_dc` | DC load (only with `dc_load`) | 30, 31, ... |
 
 Published paths:
 
@@ -89,7 +92,8 @@ Published paths:
   `/Ac/L{1,2,3}/Energy/{Forward,Reverse}`
 - PV inverter: `/Ac/Power`, `/Ac/Energy/Forward`, `/Ac/L<n>/{Voltage,Current,Power,Energy/Forward}`,
   `/Ac/MaxPower`, `/Position` (0 = AC input), `/StatusCode` (7 = running, 8 = standby), `/ErrorCode`
-- Both: the mandatory paths (`/Connected`, `/DeviceInstance`, `/ProductName`, ...) and `/CustomName`
+- DC load: `/Dc/0/{Voltage,Current,Power}` (positive = consuming)
+- All: the mandatory paths (`/Connected`, `/DeviceInstance`, `/ProductName`, ...) and `/CustomName`
 
 ## Configuration
 
@@ -103,6 +107,10 @@ Copy `config.sample.ini` to `config.ini` and adjust it.
 | `mqtt`           | `client_id`    | MQTT client ID (default `venus-mqtt-meters`)                           |
 | `shelly`         | `topic_prefix` | Shelly MQTT prefix, e.g. `shellypro3em-aabbccddeeff`. Omit the section to disable |
 | `opendtu`        | `topic_prefix` | OpenDTU MQTT base topic (default `solar`)                              |
+| `opendtu`        | `dc_load`      | Also publish the inverters' DC input as `dcsystem` (default `no`, see below) |
+| `opendtu`        | `dc_load_factor` | Scale the DC power, `0 < factor <= 1` (default 1.0)                  |
+| `opendtu`        | `dc_load_timeout` | Seconds without a fresh DC reading before the DC load is cleared (default 15) |
+| `inverter:<serial>` | `dc_load`   | Override `opendtu.dc_load` for this inverter                           |
 | `inverter:<serial>` | `name`      | Name shown in the GUI                                                  |
 | `inverter:<serial>` | `phase`     | Grid phase the inverter is connected to: `L1`, `L2` or `L3` (default `L1`) |
 | `inverter:<serial>` | `max_power` | Rated AC power in W (default 800)                                      |
@@ -179,6 +187,28 @@ Victron MPPTs. Venus OS has no device type for a battery-fed micro-inverter, so 
 as PV inverters. Live power flows and the calculated AC consumption are correct, but **solar yield
 totals in the GUI and in VRM count that energy twice**: once when the MPPT harvests it and again
 when the inverter feeds it into the house.
+
+### DC load for DVCC (`dc_load`)
+
+With DVCC and a BMS, Venus limits the MPPTs to the battery's charge current limit (CCL). It only adds
+DC loads to that limit if they are *measured* (`/Dc/System/MeasurementType == 1`, i.e. at least one
+`com.victronenergy.dcsystem` service exists; see `delegates/dvcc.py` in dbus-systemcalc-py). Without
+that, battery-fed inverters take their power out of the CCL: near full charge the MPPTs throttle and
+the inverters drain whatever little the battery may still take.
+
+`dc_load = yes` publishes each inverter's DC input power (`0/powerdc`) as a `dcsystem` service, so the
+MPPT limit becomes CCL + inverter DC current. To avoid pushing more than the CCL into a full battery
+when the reading is wrong, the values are cleared (DVCC then adds 0 A) when
+
+- no fresh `powerdc` arrived for `dc_load_timeout` seconds, the inverter reports `reachable = 0` or
+  the MQTT connection drops,
+- the message is a retained one (could be hours old; values are only taken from live publishes),
+- the value is negative or above 1.15 × `max_power` (ignored, then times out).
+
+DVCC low-pass filters the DC current (about 10 s), so a sudden drop of the inverter load can still
+push a few amps above the CCL for some seconds; the charge voltage limit and the BMS still apply.
+A `dc_load_factor` below 1 adds margin, but with full solar passthrough (inverters = MPPT output)
+it also caps how far the MPPTs can ramp up when the CCL is small.
 
 ## Troubleshooting
 
